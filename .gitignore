@@ -1,0 +1,25 @@
+# Dependencies
+node_modules/
+client/node_modules/
+server/node_modules/
+
+# Session data — never commit these
+richstore/pairing/*/
+richstore/auth.json
+
+# Build output
+client/dist/
+
+# Logs
+logs/
+*.log
+
+# Environment
+.env
+
+# Auth files
+richstore/pairing/pairing.json
+
+# OS
+.DS_Store
+Thumbs.db
