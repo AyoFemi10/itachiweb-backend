@@ -3,8 +3,16 @@ const cors = require('cors');
 const path = require('path');
 const fs = require('fs');
 const { existsSync, readdirSync } = require('fs');
+const {
+  makeWASocket,
+  useMultiFileAuthState,
+  DisconnectReason,
+  makeCacheableSignalKeyStore,
+} = require('@whiskeysockets/baileys');
+const pino = require('pino');
 
 const ROOT = path.resolve(__dirname, '..');
+const PAIRING_DIR = path.join(ROOT, 'richstore', 'pairing');
 
 const app = express();
 const PORT = process.env.PORT || 5000;
@@ -19,15 +27,13 @@ app.use(cors({
   credentials: true
 }));
 app.use(express.json());
-// No static files — frontend is hosted on Vercel
 
-// ── SSE clients ──────────────────────────────────────────
+// ── SSE clients ───────────────────────────────────────────
 const sseClients = new Set();
 
 function getPairedCount() {
-  const dir = path.join(ROOT, 'richstore', 'pairing');
-  if (!existsSync(dir)) return 0;
-  return readdirSync(dir, { withFileTypes: true })
+  if (!existsSync(PAIRING_DIR)) return 0;
+  return readdirSync(PAIRING_DIR, { withFileTypes: true })
     .filter(d => d.isDirectory() && d.name.endsWith('@s.whatsapp.net'))
     .length;
 }
@@ -54,7 +60,7 @@ app.get('/stats/stream', (req, res) => {
   req.on('close', () => sseClients.delete(send));
 });
 
-// ── Pair endpoint ─────────────────────────────────────────
+// ── Pair endpoint — own clean Baileys socket, no pair.js ─
 app.post('/pair', async (req, res) => {
   let { phone } = req.body;
   if (!phone) return res.status(400).json({ error: 'Phone number is required' });
@@ -65,49 +71,79 @@ app.post('/pair', async (req, res) => {
   if (getPairedCount() >= MAX_PAIRS)
     return res.status(429).json({ error: `Server is full (${MAX_PAIRS} pairs reached). Try again later.` });
 
+  const sessionPath = path.join(PAIRING_DIR, phone + '@s.whatsapp.net');
+
+  // Clean any stale session for this number
+  if (existsSync(sessionPath))
+    fs.rmSync(sessionPath, { recursive: true, force: true });
+
   try {
-    // Clear require cache so each pair gets a fresh socket connection
-    const pairPath = path.join(ROOT, 'pair.js');
-    delete require.cache[pairPath];
-    const startpairing = require(pairPath);
+    if (!existsSync(PAIRING_DIR)) fs.mkdirSync(PAIRING_DIR, { recursive: true });
 
-    const jid = phone + '@s.whatsapp.net';
+    const { state, saveCreds } = await useMultiFileAuthState(sessionPath);
 
-    // startpairing connects and writes pairing.json with the code
-    await startpairing(jid);
-
-    // Wait for pairing.json to be written (pair.js does this after 3s)
-    await new Promise((resolve, reject) => {
-      const pairingFile = path.join(ROOT, 'richstore', 'pairing', 'pairing.json');
-      const start = Date.now();
-      const poll = setInterval(() => {
-        if (existsSync(pairingFile)) {
-          try {
-            const data = JSON.parse(fs.readFileSync(pairingFile, 'utf8'));
-            if (data.number === jid || data.number === phone) {
-              clearInterval(poll);
-              resolve(data.code);
-            }
-          } catch (_) {}
-        }
-        if (Date.now() - start > 20000) {
-          clearInterval(poll);
-          reject(new Error('Timed out waiting for pairing code'));
-        }
-      }, 500);
-    }).then((code) => {
-      broadcastStats();
-      res.json({ code });
+    const sock = makeWASocket({
+      auth: {
+        creds: state.creds,
+        keys: makeCacheableSignalKeyStore(state.keys, pino({ level: 'silent' })),
+      },
+      printQRInTerminal: false,
+      logger: pino({ level: 'silent' }),
+      browser: ['ITACHI MD', 'Chrome', '1.0.0'],
     });
+
+    sock.ev.on('creds.update', saveCreds);
+
+    const code = await new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        sock.end();
+        reject(new Error('Timed out waiting for pairing code'));
+      }, 20000);
+
+      // Request pairing code after socket initialises
+      setTimeout(async () => {
+        try {
+          if (!sock.authState.creds.registered) {
+            const raw = await sock.requestPairingCode(phone);
+            const formatted = raw?.match(/.{1,4}/g)?.join('-') || raw;
+            clearTimeout(timeout);
+            resolve(formatted);
+          }
+        } catch (err) {
+          clearTimeout(timeout);
+          reject(err);
+        }
+      }, 3000);
+
+      sock.ev.on('connection.update', ({ connection, lastDisconnect }) => {
+        if (connection === 'open') {
+          clearTimeout(timeout);
+          resolve(null); // already registered
+        }
+        if (connection === 'close') {
+          const reason = lastDisconnect?.error?.output?.statusCode;
+          // 401 after code is sent = user hasn't linked yet, that's fine
+          if (reason !== DisconnectReason.loggedOut) {
+            // don't reject — code was already sent
+          }
+        }
+      });
+    });
+
+    broadcastStats();
+    // code can be null if already registered — shouldn't happen on fresh session
+    res.json({ code: code || 'Already registered' });
 
   } catch (err) {
     console.error('Pairing error:', err.message);
+    if (existsSync(sessionPath))
+      fs.rmSync(sessionPath, { recursive: true, force: true });
     if (!res.headersSent)
       res.status(500).json({ error: err.message || 'Failed to generate pairing code' });
   }
 });
 
-// ── Health check ─────────────────────────────────────────
+// ── Health check ──────────────────────────────────────────
 app.get('/', (_req, res) => res.json({ status: 'ITACHI MD API running' }));
 
 app.listen(PORT, () => {
