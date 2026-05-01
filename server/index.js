@@ -12,6 +12,7 @@ const MAX_PAIRS = 300;
 app.use(cors({
   origin: [
     'http://localhost:5173',
+    'https://itachiweb.ayohost.site',
     process.env.FRONTEND_URL || '*'
   ],
   credentials: true
