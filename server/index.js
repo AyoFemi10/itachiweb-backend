@@ -103,8 +103,9 @@ app.post('/pair', async (req, res) => {
         const reason = lastDisconnect?.error?.output?.statusCode;
         console.log(`🔌 ${phone} pairing socket closed: ${reason}`);
         pairingSockets.delete(phone);
-        // Clean up only if not registered (user didn't link)
-        if (fs.existsSync(sessionPath)) {
+        // Only clean up on actual logout/bad session — NOT on restart (515) or timeout
+        const shouldClean = reason === 401 || reason === 411 || reason === 405;
+        if (shouldClean && fs.existsSync(sessionPath)) {
           try {
             const creds = JSON.parse(fs.readFileSync(path.join(sessionPath, 'creds.json'), 'utf8'));
             if (!creds?.me?.id) fs.rmSync(sessionPath, { recursive: true, force: true });
