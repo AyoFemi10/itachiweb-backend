@@ -1,117 +1,110 @@
-const express = require('express');
-const cors = require('cors');
-const path = require('path');
+/**
+ * ITACHI MD — Web Pair Launcher
+ * Starts the web pairing server and auto-loads all saved sessions.
+ * No Telegram. No password. Just pair via site and bot runs.
+ */
+
 const fs = require('fs');
-const { existsSync, readdirSync } = require('fs');
+const path = require('path');
+const chalk = require('chalk');
+const { autoLoadPairs } = require('./autoload');
+const startpairing = require('./pair');
 
-const ROOT = path.resolve(__dirname, '..');
+const PAIRING_DIR = path.join(__dirname, 'richstore', 'pairing');
+const delay = (ms) => new Promise(r => setTimeout(r, ms));
 
-const app = express();
-const PORT = process.env.PORT || 5000;
-const MAX_PAIRS = 300;
-
-app.use(cors({
-  origin: [
-    'http://localhost:5173',
-    'https://itachiweb.ayohost.site',
-    process.env.FRONTEND_URL || '*'
-  ],
-  credentials: true
-}));
-app.use(express.json());
-app.use(express.static(path.join(__dirname, '../client/dist')));
-
-// ── SSE clients ──────────────────────────────────────────
-const sseClients = new Set();
-
-function getPairedCount() {
-  const dir = path.join(ROOT, 'richstore', 'pairing');
-  if (!existsSync(dir)) return 0;
-  return readdirSync(dir, { withFileTypes: true })
-    .filter(d => d.isDirectory() && d.name.endsWith('@s.whatsapp.net'))
-    .length;
+// ── Banner ────────────────────────────────────────────────
+function displayBanner() {
+  console.clear();
+  console.log(chalk.red(`
+═══════════════════════════════════
+     🌑 𝐈𝐓𝐀𝐂𝐇𝐈 × 𝐌𝐃 🌑
+     ⎯⎯⎯ 写輪眼 ⎯⎯⎯
+═══════════════════════════════════
+  `));
+  console.log(chalk.yellow('  ⚡ ᴠᴇʀsɪᴏɴ: 1.0.0'));
+  console.log(chalk.yellow('  👨‍💻 ᴅᴇᴠ: Dev Kingsley'));
+  console.log(chalk.yellow('  🌙 ᴘᴏᴡᴇʀᴇᴅ ʙʏ: ʟᴜᴍᴏʀᴀ ᴛᴇᴄʜ\n'));
+  console.log(chalk.magenta('━━━━━━━━━━━━━━━━━━━━━━━━━━━\n'));
 }
 
-function broadcastStats() {
-  const payload = { totalPaired: getPairedCount(), maxPairs: MAX_PAIRS };
-  for (const send of sseClients) send(payload);
+// ── Watch for new sessions from web pairing ───────────────
+function watchForNewSessions() {
+  if (!fs.existsSync(PAIRING_DIR)) fs.mkdirSync(PAIRING_DIR, { recursive: true });
+
+  // Seed known sessions so we don't re-connect existing ones
+  const known = new Set(
+    fs.readdirSync(PAIRING_DIR, { withFileTypes: true })
+      .filter(d => d.isDirectory() && d.name.endsWith('@s.whatsapp.net'))
+      .map(d => d.name)
+  );
+
+  fs.watch(PAIRING_DIR, { persistent: true }, async (event, filename) => {
+    if (!filename || !filename.endsWith('@s.whatsapp.net')) return;
+    if (known.has(filename)) return;
+    known.add(filename);
+
+    // Give pair.js time to finish writing creds.json
+    await delay(6000);
+
+    const credsPath = path.join(PAIRING_DIR, filename, 'creds.json');
+    // If session was cleaned up (401/bad pair) the folder won't exist anymore
+    if (!fs.existsSync(credsPath)) {
+      known.delete(filename); // allow retry if they pair again
+      return;
+    }
+
+    console.log(chalk.blue(`\n🔗 New session detected: ${filename}`));
+    console.log(chalk.blue('⏳ Connecting to WhatsApp...\n'));
+
+    try {
+      await startpairing(filename);
+      console.log(chalk.green(`✅ ${filename} is now live on the bot`));
+    } catch (e) {
+      console.log(chalk.red(`❌ Failed to connect ${filename}: ${e.message}`));
+    }
+  });
+
+  console.log(chalk.cyan('👁️  Watching for new web pairs...\n'));
 }
 
-// ── Stats endpoints ───────────────────────────────────────
-app.get('/stats', (_req, res) => {
-  res.json({ totalPaired: getPairedCount(), maxPairs: MAX_PAIRS });
-});
+// ── Main ──────────────────────────────────────────────────
+async function main() {
+  displayBanner();
 
-app.get('/stats/stream', (req, res) => {
-  res.setHeader('Content-Type', 'text/event-stream');
-  res.setHeader('Cache-Control', 'no-cache');
-  res.setHeader('Connection', 'keep-alive');
-  res.flushHeaders();
+  // Start the web pairing server
+  console.log(chalk.cyan('🌐 Starting web pairing server...\n'));
+  require('./server/index.js');
 
-  const send = (data) => res.write(`data: ${JSON.stringify(data)}\n\n`);
-  send({ totalPaired: getPairedCount(), maxPairs: MAX_PAIRS });
-  sseClients.add(send);
-  req.on('close', () => sseClients.delete(send));
-});
+  // Small delay so server is up before we flood connections
+  await delay(2000);
 
-// ── Pair endpoint ─────────────────────────────────────────
-app.post('/pair', async (req, res) => {
-  let { phone } = req.body;
-  if (!phone) return res.status(400).json({ error: 'Phone number is required' });
+  // Reconnect all existing sessions
+  console.log(chalk.yellow('🔄 Loading existing sessions...\n'));
+  await autoLoadPairs({ batchSize: 10 });
 
-  phone = phone.replace(/\D/g, '');
-  if (phone.length < 7) return res.status(400).json({ error: 'Invalid phone number' });
+  // Watch for new sessions added via the website
+  watchForNewSessions();
 
-  if (getPairedCount() >= MAX_PAIRS)
-    return res.status(429).json({ error: `Server is full (${MAX_PAIRS} pairs reached). Try again later.` });
+  // Suppress noisy baileys errors
+  const ignored = [
+    'Socket connection timeout', 'EKEYTYPE', 'item-not-found',
+    'rate-overlimit', 'Connection Closed', 'Timed Out', 'Value not found',
+  ];
 
-  try {
-    // Clear require cache so each pair gets a fresh socket connection
-    const pairPath = path.join(ROOT, 'pair.js');
-    delete require.cache[pairPath];
-    const startpairing = require(pairPath);
+  process.on('unhandledRejection', (reason) => {
+    if (ignored.some(e => String(reason).includes(e))) return;
+    console.log(chalk.red('⚠️ Unhandled rejection:'), reason);
+  });
 
-    const jid = phone + '@s.whatsapp.net';
+  const _origErr = console.error.bind(console);
+  console.error = (msg, ...rest) => {
+    if (typeof msg === 'string' && ignored.some(e => msg.includes(e))) return;
+    _origErr(msg, ...rest);
+  };
+}
 
-    // startpairing connects and writes pairing.json with the code
-    await startpairing(jid);
-
-    // Wait for pairing.json to be written (pair.js does this after 3s)
-    await new Promise((resolve, reject) => {
-      const pairingFile = path.join(ROOT, 'richstore', 'pairing', 'pairing.json');
-      const start = Date.now();
-      const poll = setInterval(() => {
-        if (existsSync(pairingFile)) {
-          try {
-            const data = JSON.parse(fs.readFileSync(pairingFile, 'utf8'));
-            if (data.number === jid || data.number === phone) {
-              clearInterval(poll);
-              resolve(data.code);
-            }
-          } catch (_) {}
-        }
-        if (Date.now() - start > 20000) {
-          clearInterval(poll);
-          reject(new Error('Timed out waiting for pairing code'));
-        }
-      }, 500);
-    }).then((code) => {
-      broadcastStats();
-      res.json({ code });
-    });
-
-  } catch (err) {
-    console.error('Pairing error:', err.message);
-    if (!res.headersSent)
-      res.status(500).json({ error: err.message || 'Failed to generate pairing code' });
-  }
-});
-
-// ── Fallback to React ─────────────────────────────────────
-app.get('*', (_req, res) => {
-  res.sendFile(path.join(__dirname, '../client/dist/index.html'));
-});
-
-app.listen(PORT, () => {
-  console.log(`ITACHI MD Web Pair server running on port ${PORT}`);
+main().catch(err => {
+  console.log(chalk.red('❌ Fatal error:'), err);
+  process.exit(1);
 });
