@@ -536,6 +536,7 @@ async function startpairing(nexusDevNumber) {
     nexus.ev.on("connection.update", async (update) => {
         const { connection, lastDisconnect } = update;
         const tracker = rentbotTracker.get(nexusDevNumber);
+        if (!tracker) return; // session was cleaned up, ignore stale events
 
         if (connection === "close") {
             let reason = new Boom(lastDisconnect?.error)?.output.statusCode;
