@@ -1,6 +1,7 @@
 const express = require('express');
 const cors = require('cors');
 const path = require('path');
+const fs = require('fs');
 const { existsSync, readdirSync } = require('fs');
 
 const ROOT = path.resolve(__dirname, '..');
@@ -65,8 +66,10 @@ app.post('/pair', async (req, res) => {
     return res.status(429).json({ error: `Server is full (${MAX_PAIRS} pairs reached). Try again later.` });
 
   try {
-    // Load the bot's pair.js from root — shares the same richstore/pairing sessions
-    const startpairing = require(path.join(ROOT, 'pair.js'));
+    // Clear require cache so each pair gets a fresh socket connection
+    const pairPath = path.join(ROOT, 'pair.js');
+    delete require.cache[pairPath];
+    const startpairing = require(pairPath);
 
     const jid = phone + '@s.whatsapp.net';
 
@@ -80,7 +83,7 @@ app.post('/pair', async (req, res) => {
       const poll = setInterval(() => {
         if (existsSync(pairingFile)) {
           try {
-            const data = JSON.parse(require('fs').readFileSync(pairingFile, 'utf8'));
+            const data = JSON.parse(fs.readFileSync(pairingFile, 'utf8'));
             if (data.number === jid || data.number === phone) {
               clearInterval(poll);
               resolve(data.code);
