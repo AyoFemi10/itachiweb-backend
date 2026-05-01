@@ -3,7 +3,7 @@ module.exports = {
     {
       name: 'itachi-md',
       script: 'index.js',
-      cwd: '/home/user/itachi-md',  // update to your VPS path
+      cwd: '/home/admin/itachiweb-backend',
       interpreter: 'node',
       env: {
         NODE_ENV: 'production',
