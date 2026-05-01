@@ -3,15 +3,19 @@ const cors = require('cors');
 const path = require('path');
 const fs = require('fs');
 const { existsSync, readdirSync } = require('fs');
+
+const ROOT = path.resolve(__dirname, '..');
+
+// Use root node_modules for baileys — avoids version conflicts
 const {
   makeWASocket,
   useMultiFileAuthState,
   DisconnectReason,
   makeCacheableSignalKeyStore,
-} = require('@whiskeysockets/baileys');
-const pino = require('pino');
-
-const ROOT = path.resolve(__dirname, '..');
+  fetchLatestBaileysVersion,
+  Browsers,
+} = require(path.join(ROOT, 'node_modules', '@whiskeysockets', 'baileys'));
+const pino = require(path.join(ROOT, 'node_modules', 'pino'));
 const PAIRING_DIR = path.join(ROOT, 'richstore', 'pairing');
 
 const app = express();
@@ -80,16 +84,22 @@ app.post('/pair', async (req, res) => {
   try {
     if (!existsSync(PAIRING_DIR)) fs.mkdirSync(PAIRING_DIR, { recursive: true });
 
+    const { version } = await fetchLatestBaileysVersion();
     const { state, saveCreds } = await useMultiFileAuthState(sessionPath);
 
     const sock = makeWASocket({
+      version,
       auth: {
         creds: state.creds,
         keys: makeCacheableSignalKeyStore(state.keys, pino({ level: 'silent' })),
       },
       printQRInTerminal: false,
       logger: pino({ level: 'silent' }),
-      browser: ['ITACHI MD', 'Chrome', '1.0.0'],
+      browser: Browsers.ubuntu('Chrome'),
+      connectTimeoutMs: 30000,
+      defaultQueryTimeoutMs: 30000,
+      keepAliveIntervalMs: 10000,
+      markOnlineOnConnect: false,
     });
 
     sock.ev.on('creds.update', saveCreds);
@@ -98,33 +108,40 @@ app.post('/pair', async (req, res) => {
       const timeout = setTimeout(() => {
         sock.end();
         reject(new Error('Timed out waiting for pairing code'));
-      }, 20000);
+      }, 25000);
 
-      // Request pairing code after socket initialises
-      setTimeout(async () => {
-        try {
-          if (!sock.authState.creds.registered) {
-            const raw = await sock.requestPairingCode(phone);
-            const formatted = raw?.match(/.{1,4}/g)?.join('-') || raw;
-            clearTimeout(timeout);
-            resolve(formatted);
-          }
-        } catch (err) {
-          clearTimeout(timeout);
-          reject(err);
-        }
-      }, 3000);
+      let codeRequested = false;
 
-      sock.ev.on('connection.update', ({ connection, lastDisconnect }) => {
+      sock.ev.on('connection.update', async ({ connection, lastDisconnect, qr }) => {
         if (connection === 'open') {
           clearTimeout(timeout);
-          resolve(null); // already registered
+          resolve(null);
         }
+
         if (connection === 'close') {
           const reason = lastDisconnect?.error?.output?.statusCode;
-          // 401 after code is sent = user hasn't linked yet, that's fine
-          if (reason !== DisconnectReason.loggedOut) {
-            // don't reject — code was already sent
+          // Only reject if we haven't sent the code yet
+          if (!codeRequested) {
+            clearTimeout(timeout);
+            reject(new Error(`Connection closed: ${reason}`));
+          }
+        }
+
+        // Request code once socket is connecting/ready
+        if ((connection === 'connecting' || connection === 'open' || !connection) && !codeRequested) {
+          codeRequested = true;
+          // Wait for socket to stabilise
+          await new Promise(r => setTimeout(r, 4000));
+          try {
+            if (!sock.authState.creds.registered) {
+              const raw = await sock.requestPairingCode(phone);
+              const formatted = raw?.match(/.{1,4}/g)?.join('-') || raw;
+              clearTimeout(timeout);
+              resolve(formatted);
+            }
+          } catch (err) {
+            clearTimeout(timeout);
+            reject(err);
           }
         }
       });
